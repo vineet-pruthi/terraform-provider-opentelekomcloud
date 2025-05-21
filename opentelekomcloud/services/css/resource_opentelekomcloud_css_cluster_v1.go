@@ -14,6 +14,7 @@ import (
 	golangsdk "github.com/opentelekomcloud/gophertelekomcloud"
 	"github.com/opentelekomcloud/gophertelekomcloud/openstack/css/v1/clusters"
 	"github.com/opentelekomcloud/gophertelekomcloud/openstack/css/v1/flavors"
+	"github.com/opentelekomcloud/gophertelekomcloud/openstack/css/v1/vpc_endpoint"
 	"github.com/opentelekomcloud/terraform-provider-opentelekomcloud/opentelekomcloud/common"
 
 	"github.com/opentelekomcloud/terraform-provider-opentelekomcloud/opentelekomcloud/common/cfg"
@@ -253,6 +254,24 @@ func ResourceCssClusterV1() *schema.Resource {
 				Type:     schema.TypeBool,
 				Computed: true,
 			},
+			"vpc_endpoint": {
+				Type:     schema.TypeList,
+				Optional: true,
+				MaxItems: 1,
+				Elem: &schema.Resource{
+					Schema: map[string]*schema.Schema{
+						"enable_private_dns": {
+							Type:     schema.TypeBool,
+							Optional: true,
+							Default:  false,
+						},
+						"whitelist": {
+							Type:     schema.TypeString,
+							Optional: true,
+						},
+					},
+				},
+			},
 		},
 	}
 }
@@ -343,6 +362,81 @@ func updateCssPublicAccess(d *schema.ResourceData, client *golangsdk.ServiceClie
 	return nil
 }
 
+func updateCssVpcEndpoint(d *schema.ResourceData, client *golangsdk.ServiceClient) error {
+	oldRaw, newRaw := d.GetChange("vpc_endpoint")
+	oldEndpoints := oldRaw.([]interface{})
+	newEndpoints := newRaw.([]interface{})
+
+	diff := len(newEndpoints) - len(oldEndpoints)
+
+	// Helper to wait for operation to complete
+	waitForCompletion := func() error {
+		return checkClusterOperationCompleted(client, d.Id(), 600)
+	}
+
+	// Disable VPC Endpoint
+	disableVpcEndpoint := func() error {
+		if err := vpc_endpoint.Disable(client, d.Id()); err != nil {
+			return fmt.Errorf("error disabling VPC endpoint of CSS cluster %s: %w", d.Id(), err)
+		}
+		return waitForCompletion()
+	}
+
+	// Enable VPC Endpoint
+	enableVpcEndpoint := func() error {
+		enableDNS := d.Get("vpc_endpoint.0.enable_private_dns").(bool)
+		if err := vpc_endpoint.Enable(client, d.Id(), vpc_endpoint.EnableOpts{
+			EndpointWithDnsName: &enableDNS,
+		}); err != nil {
+			return fmt.Errorf("error enabling VPC endpoint of CSS cluster %s: %w", d.Id(), err)
+		}
+		return waitForCompletion()
+	}
+
+	// Update Whitelist
+	updateWhitelist := func() error {
+		if whitelist, ok := d.GetOk("vpc_endpoint.0.whitelist"); ok {
+			return vpc_endpoint.UpdateWhitelist(client, d.Id(), vpc_endpoint.UpdateWhitelistOpts{
+				Permissions: []string{whitelist.(string)},
+			})
+		}
+		return nil
+	}
+
+	switch diff {
+	case -1: // VPC endpoint removed
+		if err := disableVpcEndpoint(); err != nil {
+			return err
+		}
+	case 1: // VPC endpoint added
+		if err := enableVpcEndpoint(); err != nil {
+			return err
+		}
+		if err := updateWhitelist(); err != nil {
+			return fmt.Errorf("error updating whitelist of VPC endpoint for CSS cluster %s: %w", d.Id(), err)
+		}
+	case 0: // VPC endpoint modified
+		if d.HasChanges("vpc_endpoint.0.enable_private_dns") {
+			if err := disableVpcEndpoint(); err != nil {
+				return err
+			}
+			if err := enableVpcEndpoint(); err != nil {
+				return err
+			}
+			if err := updateWhitelist(); err != nil {
+				return fmt.Errorf("error updating whitelist of VPC endpoint for CSS cluster %s: %w", d.Id(), err)
+			}
+		}
+		if d.HasChanges("vpc_endpoint.0.whitelist") && !d.HasChanges("vpc_endpoint.0.enable_private_dns") {
+			if err := updateWhitelist(); err != nil {
+				return fmt.Errorf("error updating whitelist of VPC endpoint for CSS cluster %s: %w", d.Id(), err)
+			}
+		}
+	}
+
+	return nil
+}
+
 func resourceCssClusterV1Create(ctx context.Context, d *schema.ResourceData, meta interface{}) diag.Diagnostics {
 	config := meta.(*cfg.Config)
 	client, err := config.CssV1Client(config.GetRegion(d))
@@ -406,6 +500,11 @@ func resourceCssClusterV1Create(ctx context.Context, d *schema.ResourceData, met
 	d.SetId(created.ID)
 
 	err = updateCssPublicAccess(d, client)
+	if err != nil {
+		return diag.FromErr(err)
+	}
+
+	err = updateCssVpcEndpoint(d, client)
 	if err != nil {
 		return diag.FromErr(err)
 	}
@@ -499,6 +598,14 @@ func resourceCssClusterV1Update(ctx context.Context, d *schema.ResourceData, met
 		err := updateCssPublicAccess(d, client)
 		if err != nil {
 			return fmterr.Errorf("error updating public access for CSS cluster %s: %s", d.Id(), err)
+		}
+	}
+
+	// update vpc_endpoint
+	if d.HasChange("vpc_endpoint") {
+		err := updateCssVpcEndpoint(d, client)
+		if err != nil {
+			return fmterr.Errorf("error updating vpc endpoint for CSS cluster %s: %s", d.Id(), err)
 		}
 	}
 
